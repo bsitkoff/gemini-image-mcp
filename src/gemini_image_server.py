@@ -1,7 +1,12 @@
 #!/usr/bin/env python3
 """
-GEMINI IMAGE GENERATION MCP SERVER - v3.1
+GEMINI IMAGE GENERATION MCP SERVER - v3.2
 Multiple reference images (up to 14), external config file, and quality tiers
+
+CHANGES FROM v3.1:
+1. Added output_dir parameter to generate_image — save images to a custom directory
+2. Added return_base64 parameter to generate_image — return image data in the tool response
+   (enables Claude's container to save images locally for file outputs like slides)
 
 CHANGES FROM v3.0:
 1. Added quality parameter: "pro" (default, Gemini 3 Pro) or "fast" (Gemini 2.0 Flash)
@@ -15,6 +20,7 @@ import os
 import base64
 import requests
 import subprocess
+import shutil
 from datetime import datetime
 
 # --- Configuration ---
@@ -98,8 +104,20 @@ def _encode_reference_images(paths):
     return parts
 
 # --- Core functions ---
-def generate_image(prompt, aspect_ratio="1:1", image_size="large", reference_image=None, reference_images=None, quality="pro"):
-    """Generate image using Gemini API with resolution control, multiple reference images, and quality tiers"""
+def generate_image(prompt, aspect_ratio="1:1", image_size="large", reference_image=None, reference_images=None, quality="pro", output_dir=None, return_base64=False, max_dimension=None, transparent_bg=False):
+    """Generate image using Gemini API with resolution control, multiple reference images, and quality tiers.
+
+    Args:
+        output_dir: Optional directory to save the image to instead of the default images_dir.
+                    The directory will be created if it doesn't exist.
+        return_base64: If True, include the image as base64 data in the response.
+                       Useful when the caller needs the raw image data (e.g. Claude's container).
+        max_dimension: If set, downscale the saved PNG's longest edge to this many pixels and
+                       re-save it optimized (alpha preserved). Keeps files small for size-capped
+                       consumers (e.g. the Onionskin planner's 2MB image limit).
+        transparent_bg: If True, knock out a light grey/white background to transparent so the
+                        art reads as a cut-out sticker (preserves the saturated subject).
+    """
     api_key = os.environ.get('GEMINI_API_KEY')
     if not api_key:
         raise Exception("GEMINI_API_KEY not set")
@@ -149,16 +167,35 @@ def generate_image(prompt, aspect_ratio="1:1", image_size="large", reference_ima
     if not image_data:
         raise Exception("No image data in API response")
 
-    output_dir = CFG["images_dir"]
-    os.makedirs(output_dir, exist_ok=True)
+    # Use custom output_dir if provided, otherwise default
+    save_dir = os.path.expanduser(output_dir) if output_dir else CFG["images_dir"]
+    os.makedirs(save_dir, exist_ok=True)
 
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    filename = f"{output_dir}/gemini_image_{timestamp}.png"
+    filename = f"{save_dir}/gemini_image_{timestamp}.png"
 
     with open(filename, 'wb') as f:
         f.write(base64.b64decode(image_data))
 
-    return {
+    # Optional downscale/optimize (e.g. to fit a downstream size cap). Re-saves the PNG in
+    # place, preserving alpha. Non-fatal: a failure keeps the full-size image.
+    optimize_note = ""
+    optimized = False
+    if max_dimension or transparent_bg:
+        try:
+            uv = shutil.which("uv") or os.path.expanduser("~/.local/bin/uv")
+            script = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "scripts", "optimize-image.py")
+            cmd = [uv, "run", script, filename]
+            if max_dimension:
+                cmd.append(str(int(max_dimension)))
+            if transparent_bg:
+                cmd.append("--cutout")
+            subprocess.run(cmd, check=True, capture_output=True, text=True)
+            optimized = True
+        except Exception as e:
+            optimize_note = f" (optimize skipped: {e})"
+
+    result = {
         "success": True,
         "image_path": filename,
         "resolution": gemini_size,
@@ -166,8 +203,18 @@ def generate_image(prompt, aspect_ratio="1:1", image_size="large", reference_ima
         "quality": quality,
         "model": model,
         "reference_images_used": len(ref_paths),
-        "message": f"Image generated successfully ({quality} mode): {filename}"
+        "bytes": os.path.getsize(filename),
+        "optimized": optimized,
+        "message": f"Image generated successfully ({quality} mode): {filename}{optimize_note}"
     }
+
+    if return_base64:
+        # Re-read the (possibly optimized) file so the bytes match what's on disk.
+        with open(filename, 'rb') as f:
+            result["base64_data"] = base64.b64encode(f.read()).decode('utf-8')
+        result["mime_type"] = "image/png"
+
+    return result
 
 def add_to_batch(prompt, filename=None, aspect_ratio="16:9", image_size="large", description="", reference_image=None, reference_images=None, quality="pro"):
     """Add image to batch queue with multiple reference image support and quality tier"""
@@ -292,7 +339,7 @@ def handle_initialize(request_id):
         "result": {
             "protocolVersion": "2024-11-05",
             "capabilities": {"tools": {}},
-            "serverInfo": {"name": "gemini-image-generator", "version": "3.1.0"}
+            "serverInfo": {"name": "gemini-image-generator", "version": "3.2.0"}
         }
     })
 
@@ -330,7 +377,11 @@ def handle_tools_list(request_id):
                                 "items": {"type": "string"},
                                 "description": f"Optional list of reference image file paths, max {MAX_REF_IMAGES} (pro mode only)",
                                 "maxItems": MAX_REF_IMAGES
-                            }
+                            },
+                            "output_dir": {"type": "string", "description": "Optional directory path to save the image to instead of the default ~/Pictures/ai-generated-images/. Supports ~ expansion. The directory will be created if it doesn't exist."},
+                            "return_base64": {"type": "boolean", "description": "If true, include the generated image as base64 data in the response. Useful when the caller needs to save the image locally (e.g. Claude's container).", "default": False},
+                            "max_dimension": {"type": "integer", "description": "If set, downscale the saved PNG's longest edge to this many pixels and re-save it optimized (alpha preserved). Keeps files small for size-capped consumers — e.g. 512 for planner stickers (≈150-250KB, well under a 2MB cap)."},
+                            "transparent_bg": {"type": "boolean", "description": "If true, knock out a light grey/white background to transparent so the art reads as a cut-out sticker (the saturated subject is preserved). Use for planner/journal stickers — a plain rectangular image reads as a pasted box.", "default": False}
                         },
                         "required": ["prompt"]
                     }
@@ -419,7 +470,11 @@ def handle_tool_call(request_id, tool_name, arguments):
                 arguments.get("image_size", "large"),
                 arguments.get("reference_image"),
                 arguments.get("reference_images"),
-                arguments.get("quality", "pro")
+                arguments.get("quality", "pro"),
+                arguments.get("output_dir"),
+                arguments.get("return_base64", False),
+                arguments.get("max_dimension"),
+                arguments.get("transparent_bg", False)
             )
         elif tool_name == "add_to_batch":
             result = add_to_batch(
@@ -467,7 +522,7 @@ def handle_tool_call(request_id, tool_name, arguments):
     send_message(response)
 
 def main():
-    sys.stderr.write("Gemini Image MCP Server v3.1 - Pro/Fast Quality Tiers\n")
+    sys.stderr.write("Gemini Image MCP Server v3.4 - Quality Tiers + output_dir/return_base64/max_dimension/transparent_bg\n")
     sys.stderr.flush()
 
     while True:
