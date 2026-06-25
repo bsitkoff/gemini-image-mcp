@@ -68,6 +68,64 @@ description: Generate high-quality AI images using Gemini Imagen for any purpose
 
 ---
 
+## Cross-machine: handing an image to a Mac-side MCP (onionskin)
+
+**Read this before trying to feed a generated image into the `onionskin` planner (or any other
+MCP that runs on your Mac).** This is the #1 thing that goes wrong.
+
+### The two-machine model (why the obvious path fails)
+
+This image server does **not** run on your Mac. It runs on a remote Linux server (`mamastuff`)
+and you reach it over a tunnel. So:
+
+- `generate_image` writes the PNG **on the server's disk** and its text result reports a
+  **server** path like `/home/bridget/Pictures/ai-generated-images/gemini_image_*.png`.
+- `onionskin` runs **on your Mac** and its `write_underlay` `path` must be a **Mac** file
+  (`/Users/...`). It cannot see the server's filesystem.
+
+That `/home/...` path is on a different computer. The tell that you've made this mistake is a
+`/home/...` vs `/Users/...` mismatch. **Never pass gemini's reported `image_path` to onionskin.**
+
+### What you actually use: the returned image block
+
+`generate_image` returns the picture **inline as a real MCP `image` content block**
+(`return_image`, default `true`), downscaled to ≤1568px. That block is the actual image bytes,
+delivered to you here on the Mac — *that* is what reaches onionskin, not the server path.
+
+### The sticker recipe (canonical flow)
+
+1. **Generate small at the source** so the file is already under onionskin's 2 MB cap and no
+   re-encoding is needed:
+   ```javascript
+   gemini-custom:generate_image({
+     prompt: "a single lavender sprig sticker, soft watercolor, plain background",
+     quality: "pro",            // "fast" is fine for simple art
+     aspect_ratio: "1:1",
+     max_dimension: 512,        // ≤1568 → the inline block IS this exact ~150-250KB PNG
+     transparent_bg: true,      // optional: knock out the background for a cutout sticker
+     return_image: true         // default; gives you the image block
+   })
+   ```
+   Because `512 ≤ 1568`, the inline image block you receive **is byte-for-byte the optimized
+   file on disk** — not a separate, larger re-downscale. Verified ≈66 KB for a simple sticker.
+2. **Land it on the Mac.** Save the **image block you received** to a real Mac file that
+   onionskin can read — default `~/Pictures/onionskin-stickers/<name>.png`. (Do **not** use a
+   sandbox-only `/tmp` path onionskin can't reach, and do **not** use the server's `/home/...`
+   path.)
+3. **Hand onionskin the Mac path.** `write_underlay` with
+   `path: "/Users/.../Pictures/onionskin-stickers/<name>.png"`, tucked into a corner of `notes`.
+   PNG/JPEG only, ≤2 MB, no webp.
+
+### Anti-patterns (both seen failing in real sessions)
+
+- ❌ **Passing the `/home/...` `image_path` to onionskin.** That file is on the server, not the
+  Mac. This is the `/home` vs `/Users` mismatch.
+- ❌ **`return_base64: true` → onionskin's `data` field.** Inline base64 is slow to emit and
+  lower quality. Prefer a local `path:` **always.** (This is the "no, that's exactly what you
+  don't do" trap.)
+
+---
+
 ## Generation Methods
 
 ### Method 1: Immediate Generation (Single Image)
@@ -90,6 +148,13 @@ gemini-custom:generate_image({
   - **Note:** With `quality: "fast"`, maximum output is 1024x1024 pixels regardless of size setting
 - `quality`: "pro" or "fast" (default: "pro")
 - `reference_image`: File path or JSON array of file paths (optional, pro quality only)
+- `max_dimension`: Downscale the saved PNG's longest edge to this many px (e.g. `512` for a
+  ~150-250KB sticker). At `≤1568` the inline image block equals this exact file.
+- `transparent_bg`: Knock out a light/white background to transparent (cutout sticker).
+- `return_image`: Embed the picture as an MCP image block in the response (default `true`) — how
+  a **remote Mac client actually receives the image**. See *Cross-machine* section above.
+- `return_base64`: Put base64 image data in the JSON text payload (default `false`). Avoid for
+  onionskin — prefer a local `path:`.
 
 **Output:**
 - Image saved to configured images directory (default: `~/Pictures/ai-generated-images/`)
@@ -677,6 +742,9 @@ Extend this skill with brand-specific skills for:
 
 ## Version History
 
+- v1.1: Added **Cross-machine** section — feeding a generated image into a Mac-side MCP
+  (onionskin) via the returned image block, not the server's `/home/...` path; documented
+  `max_dimension`, `transparent_bg`, `return_image`, `return_base64`.
 - v1.0: Initial release
   - Immediate and batch generation workflows
   - Reference image support (multiple images, configurable limit)
